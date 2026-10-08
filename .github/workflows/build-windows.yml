@@ -3,6 +3,9 @@ name: Build Animatek NME (Windows)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write # Allows GitHub Actions to create the Release
+
 jobs:
   build:
     runs-on: windows-2022
@@ -20,8 +23,18 @@ jobs:
       - name: Build Release
         run: cmake --build build-win-release --config Release
 
-      - name: Upload Finished Exe
-        uses: actions/upload-artifact@v4
+      - name: Package Executable
+        run: |
+          mkdir release-dist
+          copy build-win-release\AnimatekNME_artefacts\Release\AnimatekNME.exe release-dist\
+          powershell Compress-Archive -Path release-dist\* -DestinationPath AnimatekNME-Windows.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: AnimatekNME-Windows
-          path: build-win-release/**/AnimatekNME.exe
+          tag_name: v0.21.0-windows # You can update this tag name whenever a new version drops
+          name: "Animatek NME v0.21.0 (Windows Build)"
+          generate_release_notes: true # Automatically generates release notes from commits!
+          files: AnimatekNME-Windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
