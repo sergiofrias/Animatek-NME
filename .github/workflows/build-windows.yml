@@ -1,0 +1,27 @@
+name: Build Animatek NME (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure CMake
+        run: cmake -B build-win-release -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Release
+        run: cmake --build build-win-release --config Release
+
+      - name: Upload Finished Exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnimatekNME-Windows
+          path: build-win-release/**/AnimatekNME.exe
