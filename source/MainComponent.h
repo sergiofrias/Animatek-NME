@@ -21,6 +21,7 @@
 #include "ui/MainLayout.h"
 #include "ui/EditorOptionsDialog.h"
 #include "ui/ThemeEditorWindow.h"
+#include "ui/CommunityThemesWindow.h"
 #include "ui/PresetBrowserWindow.h"
 #include "ui/KnobFloaterWindow.h"
 #include "ui/KeyboardFloaterWindow.h"
@@ -208,6 +209,21 @@ private:
     juce::String getMcpBridgeCommand() const;
 #endif
     void applyUiTheme(int index, bool persist);
+    // The user picks a theme: applyUiTheme plus the render style the theme sets (#90).
+    void chooseUiTheme(int index);
+    void importThemeFile();
+    void exportCurrentTheme();
+    void loadCommunityIndexCache();
+    void checkCommunityThemes(bool userAsked);
+    int communityNewCount() const;
+    void showCommunityThemes();
+    void refreshCommunityThemesWindow();
+    void installCommunityTheme(const CommunityThemes::Entry& entry);
+    // New version notice (#97): a newer release tag than this build, and whether the
+    // user has not opened its menu item yet (that is what the red dot on About means).
+    void checkNewVersion();
+    bool newVersionOut() const;
+    bool newVersionUnseen() const;
     void applyThemeLive(const EditorTheme& theme);   // theme editor preview, not in the registry
     void showThemeEditor();
     void toggleWireframe();
@@ -387,6 +403,13 @@ private:
     std::unique_ptr<PresetBrowserWindow> presetBrowserWindow;
     std::unique_ptr<KnobFloaterWindow> knobFloaterWindow;
     std::unique_ptr<ThemeEditorWindow> themeEditorWindow;
+    // Community themes (#91): the last list read from animatek/nme-themes (also cached on
+    // disk, so the menu can mark new ones before the network answers).
+    std::unique_ptr<CommunityThemesWindow> communityThemesWindow;
+    std::vector<CommunityThemes::Entry> communityThemes;
+    juce::StringArray communitySeenWhenOpened;   // the "New" badges in the open window
+    bool communityBusy = false;
+    juce::String communityStatus;
     std::unique_ptr<KeyboardFloaterWindow> keyboardFloaterWindow;
     std::unique_ptr<PatchNotesFloaterWindow> patchNotesFloaterWindow;
     std::unique_ptr<MutatorWindow> mutatorWindow;

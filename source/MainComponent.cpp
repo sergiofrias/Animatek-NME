@@ -14,6 +14,8 @@
 #include "ui/AppTheme.h"
 #include "ui/ThemeRegistry.h"
 #include "ui/ThemeFile.h"
+#include "ui/AppLookAndFeel.h"
+#include "ui/VersionCheck.h"
 #include "model/Mutator.h"
 #include "model/MutationCategories.h"
 #include "format/ValueFormatters.h"
@@ -35,8 +37,18 @@ static juce::String portKey(const char* base, int synth) {
   return synth == 0 ? juce::String(base) : juce::String(base) + "_" + juce::String(synth + 1);
 }
 
+// One AppLookAndFeel as the default for as long as any editor is open (the plugin can
+// have several); AppTheme colours whichever is the default, so it is set first.
+static int appLookAndFeelUsers = 0;
+static AppLookAndFeel& appLookAndFeel() {
+  static AppLookAndFeel lf;
+  return lf;
+}
+
 MainComponent::MainComponent(juce::ApplicationProperties &props)
     : appProperties(props) {
+  if (appLookAndFeelUsers++ == 0)
+    juce::LookAndFeel::setDefaultLookAndFeel(&appLookAndFeel());
   editorOptions = EditorOptions::load(appProperties.getUserSettings());
   AppTheme::setPalette(ThemeRegistry::get(editorOptions.uiThemeIndex).app);
   editorOptions.ensureLibraryFolders();
@@ -1016,6 +1028,23 @@ MainComponent::MainComponent(juce::ApplicationProperties &props)
   extrasFlushTimer = std::make_unique<ExtrasTimer>(*this);
   extrasFlushTimer->startTimer(3000);
 
+  // Up to 0.21.0, OK in MIDI Setup saved every port whose emulator had gone as switched off by
+  // hand (its device was no longer in the lists, which read as a change), and the editor never
+  // gave those ports to an emulator again: after a few emulators came and went, all of them
+  // looked taken. Once, such a port is handed back to the editor, as switched off by it.
+  if (auto* st = appProperties.getUserSettings();
+      st != nullptr && !st->getBoolValue("emulatorPortsRepaired", false)) {
+    for (int synth = 0; synth < kMaxSynths; ++synth)
+      if (DirectLink::isDeviceId(st->getValue(portKey("midiInputDevice", synth)))
+          && !st->getBoolValue(portKey("midiEnabled", synth), synth == 0)
+          && !st->getBoolValue(portKey("midiAutoOff", synth), false)) {
+        st->setValue(portKey("midiAutoOff", synth), true);
+        std::cout << "[LINK] Port " << (synth + 1) << " handed back to the emulators" << std::endl;
+      }
+    st->setValue("emulatorPortsRepaired", true);
+    st->saveIfNeeded();
+  }
+
   // G1-Emu found on its own (#83): every few seconds, look for emulator instances on their direct
   // link and give each free one a free port. The first look waits for the saved ports to be tried.
   struct EmulatorScanTimer : public juce::Timer {
@@ -1036,6 +1065,17 @@ MainComponent::MainComponent(juce::ApplicationProperties &props)
 
     // Reopen floater windows that were open last session
     juce::Timer::callAfterDelay(600, [safeThis]() { if (safeThis) safeThis->restoreFloaterWindows(); });
+
+    // Community themes (#91): the cached list now, the repository at most once a day.
+    loadCommunityIndexCache();
+    const auto dayMs = juce::int64(24) * 60 * 60 * 1000;
+    if (editorOptions.checkCommunityThemes
+        && juce::Time::currentTimeMillis() - editorOptions.communityThemesChecked > dayMs)
+      juce::Timer::callAfterDelay(4000, [safeThis]() { if (safeThis) safeThis->checkCommunityThemes(false); });
+    // New version notice (#97), on the same once-a-day footing.
+    if (editorOptions.checkNewVersion
+        && juce::Time::currentTimeMillis() - editorOptions.newVersionChecked > dayMs)
+      juce::Timer::callAfterDelay(5000, [safeThis]() { if (safeThis) safeThis->checkNewVersion(); });
   }
 
 #if NME_MCP_BRIDGE
@@ -1114,6 +1154,9 @@ MainComponent::~MainComponent() {
   knobFloaterWindow.reset();
   keyboardFloaterWindow.reset();
   mainLayout.reset();
+  communityThemesWindow.reset();
+  if (--appLookAndFeelUsers == 0)
+    juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
 }
 
 void MainComponent::paint(juce::Graphics& g) {
@@ -1197,7 +1240,7 @@ bool MainComponent::keyPressed(const juce::KeyPress& key) {
   }
   if (key == juce::KeyPress('t', juce::ModifierKeys::commandModifier, 0))
   {
-    applyUiTheme(editorOptions.uiThemeIndex + 1, true);
+    chooseUiTheme(editorOptions.uiThemeIndex + 1);
     mainLayout->getStatusBar().showMessage(
         "Theme: " + ThemeRegistry::get(editorOptions.uiThemeIndex).name, 2500);
     return true;
@@ -1304,7 +1347,12 @@ bool MainComponent::keyPressed(const juce::KeyPress& key) {
 }
 
 juce::StringArray MainComponent::getMenuBarNames() {
-  return {"File", "Edit", "View", "Device", "Help", "About"};
+  // A dot on View while there are community themes the user has not seen (#91), like
+  // VCV Rack's library. Menus are picked by index, so the changed name is harmless.
+  const juce::String view = communityNewCount() > 0 ? "View" + AppLookAndFeel::newMarker() : "View";
+  // And on About while a newer version is out that the user has not looked at (#97).
+  const juce::String about = newVersionUnseen() ? "About" + AppLookAndFeel::newMarker() : "About";
+  return {"File", "Edit", view, "Device", "Help", about};
 }
 
 #if JUCE_MAC
@@ -1430,6 +1478,13 @@ juce::PopupMenu MainComponent::getMenuForIndex(int menuIndex,
     themeMenu.addSeparator();
     themeMenu.addItem(193, "Edit Theme Colours...");
     themeMenu.addItem(190, "Save Current Theme as File...");
+    themeMenu.addItem(194, "Import Theme File...");
+    if (const int fresh = communityNewCount(); fresh > 0)
+      themeMenu.addItem(196, "Community Themes...   (" + juce::String(fresh) + " new)", true, false,
+                        AppLookAndFeel::newDot());
+    else
+      themeMenu.addItem(196, "Community Themes...");
+    themeMenu.addItem(195, "Export Current Theme...");
     themeMenu.addItem(191, "Reload Theme Files");
     themeMenu.addItem(192, "Open Themes Folder");
     {
@@ -1440,6 +1495,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int menuIndex,
      #else
       juce::PopupMenu::Item themeItem("Theme");
      #endif
+      if (communityNewCount() > 0)
+        themeItem.setImage(AppLookAndFeel::newDot());
       themeItem.subMenu = std::make_unique<juce::PopupMenu>(themeMenu);
       themeItem.shortcutKeyDescription = "Ctrl+T";
       menu.addItem(std::move(themeItem));
@@ -1547,6 +1604,14 @@ juce::PopupMenu MainComponent::getMenuForIndex(int menuIndex,
   }
   else if (menuIndex == 5) // About
   {
+    if (newVersionOut()) {
+      const juce::String text = "Version " + editorOptions.latestVersion + " is out: get it on Patreon";
+      if (newVersionUnseen())
+        menu.addItem(55, text, true, false, AppLookAndFeel::newDot());
+      else
+        menu.addItem(55, text);
+      menu.addSeparator();
+    }
     menu.addItem(54, "About Animatek NME...", true);
     menu.addSeparator();
     menu.addItem(53, "Animatek NME Website", true);
@@ -1718,7 +1783,13 @@ void MainComponent::menuItemSelected(int menuItemID, int) {
     openURL("https://animatek.net/animatek-nme-eng/");
     break;
   case 50:  // Patreon
-    openURL("https://www.patreon.com/collection/2038913");
+    openURL(VersionCheck::kPatreonUrl);
+    break;
+  case 55:  // A new version is out (#97): the dot goes, the item stays until it is installed
+    openURL(VersionCheck::kPatreonUrl);
+    editorOptions.newVersionSeen = editorOptions.latestVersion;
+    editorOptions.save(appProperties.getUserSettings());
+    menuItemsChanged();
     break;
   case 51:  // GitHub
     openURL("https://github.com/animatek/Animatek-NME/");
@@ -1865,6 +1936,15 @@ void MainComponent::menuItemSelected(int menuItemID, int) {
   case 193:
     showThemeEditor();
     break;
+  case 194:
+    importThemeFile();
+    break;
+  case 196:
+    showCommunityThemes();
+    break;
+  case 195:
+    exportCurrentTheme();
+    break;
   case 192:  // Open the themes folder
     ThemeFile::userFolder().createDirectory();
     ThemeFile::userFolder().startAsProcess();
@@ -1874,7 +1954,7 @@ void MainComponent::menuItemSelected(int menuItemID, int) {
     if (menuItemID >= kSlotMenuIdBase && menuItemID < kSlotMenuIdBase + numSlots)
       toggleSlotOpen(menuItemID - kSlotMenuIdBase);   // show/hide a slot
     else if (menuItemID >= 200 && menuItemID < 200 + ThemeRegistry::count())
-      applyUiTheme(menuItemID - 200, true);
+      chooseUiTheme(menuItemID - 200);
     break;
   }
 }
@@ -3001,10 +3081,19 @@ void MainComponent::showMidiSettingsDialog() {
       this, ports,
       [this](int port, const MidiSettingsDialog::Port& wanted) {
         if (auto* st = appProperties.getUserSettings()) {
+          const auto& had = synthState[static_cast<size_t>(port)];
+          const bool wasEnabled = synthHub.synth(port).isConnected()
+                               || st->getBoolValue(portKey("midiEnabled", port), port == 0);
+          const bool userChange = wanted.enabled != wasEnabled
+                               || wanted.inputId != had.lastInputId || wanted.outputId != had.lastOutputId;
           st->setValue(portKey("midiEnabled", port), wanted.enabled);
-          // What is set here by hand is the user's: not switched on or off by the editor again.
-          st->setValue(portKey("midiAutoOff", port), false);
-          st->setValue(portKey("midiAutoPort", port), false);
+          // What is changed here by hand is the user's: not switched on or off by the editor
+          // again. Apply on a port nobody touched (it only retries an enabled port) leaves a
+          // port the editor runs for an emulator as it is.
+          if (userChange) {
+            st->setValue(portKey("midiAutoOff", port), false);
+            st->setValue(portKey("midiAutoPort", port), false);
+          }
           st->saveIfNeeded();
         }
         if (!wanted.enabled) {
@@ -3055,7 +3144,19 @@ void MainComponent::showEditorOptionsDialog() {
 }
 
 void MainComponent::applyEditorOptions(const EditorOptions& opts) {
+  const auto before = editorOptions;
   editorOptions = opts;
+  // What the background checks write is not the dialog's: its copy is from when it opened.
+  editorOptions.communityThemesChecked = before.communityThemesChecked;
+  editorOptions.communityThemesSeen    = before.communityThemesSeen;
+  editorOptions.newVersionChecked      = before.newVersionChecked;
+  editorOptions.latestVersion          = before.latestVersion;
+  editorOptions.newVersionSeen         = before.newVersionSeen;
+  // A theme picked in the dialog brings its render style, unless the dialog's own
+  // render options were changed too: then those are what the user asked for.
+  if (opts.uiThemeIndex != before.uiThemeIndex && opts.renderStyle() == before.renderStyle())
+    editorOptions.setRenderStyle(ThemeRegistry::switchRender(
+        before.renderStyle(), editorOptions.renderBeforeTheme, ThemeRegistry::get(opts.uiThemeIndex).render));
   auto libraryOk = editorOptions.ensureLibraryFolders();
   editorOptions.save(appProperties.getUserSettings());
   // Pointing the library somewhere else moves where presets are read and written.
@@ -3128,6 +3229,322 @@ void MainComponent::applyUiTheme(int index, bool persist) {
     editorOptions.save(appProperties.getUserSettings());
 }
 
+void MainComponent::chooseUiTheme(int index) {
+  const int n = ThemeRegistry::count();
+  index = ((index % n) + n) % n;
+  editorOptions.setRenderStyle(ThemeRegistry::switchRender(
+      editorOptions.renderStyle(), editorOptions.renderBeforeTheme, ThemeRegistry::get(index).render));
+  applyUiTheme(index, true);
+}
+
+void MainComponent::importThemeFile() {
+  auto chooser = std::make_shared<juce::FileChooser>(
+      "Import Theme File", juce::File::getSpecialLocation(juce::File::userDocumentsDirectory), "*.json");
+  juce::Component::SafePointer<MainComponent> safeThis(this);
+  chooser->launchAsync(
+      juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+      [safeThis, chooser](const juce::FileChooser& fc) {
+        if (safeThis == nullptr) return;
+        const auto src = fc.getResult();
+        if (!src.existsAsFile()) return;
+
+        // Only data: a file far bigger than any theme is not one, and is not read.
+        juce::String error;
+        EditorTheme theme;
+        juce::var json;
+        if (src.getSize() > ThemeFile::kMaxFileBytes)
+          error = "too big for a theme file";
+        else if (const auto text = src.loadFileAsString();
+                 ThemeFile::fromJson(text, ThemeRegistry::get(1), theme, error))
+          json = juce::JSON::parse(text);
+        if (json.getDynamicObject() == nullptr) {
+          juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Import Theme File",
+              src.getFileName() + " is not a theme file: " + error + ".");
+          return;
+        }
+
+        // A built-in's name would come back as "<name> (user)"; say where it came from instead.
+        auto name = theme.name;
+        if (ThemeRegistry::findBuiltin(name) != nullptr) {
+          name += " (imported)";
+          json.getDynamicObject()->setProperty("name", name);
+        }
+        const auto folder = ThemeFile::userFolder();
+        folder.createDirectory();
+        const auto dst = folder.getChildFile(juce::File::createLegalFileName(name) + ".json");
+
+        auto install = [safeThis, dst, name, json] {
+          if (safeThis == nullptr) return;
+          auto& bar = safeThis->mainLayout->getStatusBar();
+          if (!dst.replaceWithText(juce::JSON::toString(json, false))) {
+            bar.showMessage("Could not write " + dst.getFullPathName(), 4000);
+            return;
+          }
+          ThemeRegistry::reloadUserThemes();
+          const int idx = ThemeRegistry::indexOfName(name);
+          if (idx >= 0)
+            safeThis->chooseUiTheme(idx);
+          bar.showMessage("Theme imported: " + name, 3000);
+        };
+
+        // The user's own theme of the same name is replaced only when they say so.
+        if (dst.existsAsFile()) {
+          juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::QuestionIcon, "Import Theme File",
+              "There is already a theme called \"" + name + "\" in your themes folder. Replace it?",
+              "Replace", "Cancel", nullptr,
+              juce::ModalCallbackFunction::create([install](int ok) { if (ok != 0) install(); }));
+          return;
+        }
+        install();
+      });
+}
+
+void MainComponent::exportCurrentTheme() {
+  const auto& cur = ThemeRegistry::get(editorOptions.uiThemeIndex);
+  // Missing keys fall back to a built-in: the theme itself, or Dark for a user theme.
+  const auto json = ThemeFile::toJson(cur, ThemeRegistry::findBuiltin(cur.name) != nullptr ? cur.name : "Dark");
+  auto chooser = std::make_shared<juce::FileChooser>(
+      "Export Current Theme",
+      juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+          .getChildFile(juce::File::createLegalFileName(cur.name) + ".json"),
+      "*.json");
+  juce::Component::SafePointer<MainComponent> safeThis(this);
+  chooser->launchAsync(
+      juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+          | juce::FileBrowserComponent::warnAboutOverwriting,
+      [safeThis, chooser, json](const juce::FileChooser& fc) {
+        if (safeThis == nullptr) return;
+        auto file = fc.getResult();
+        if (file == juce::File()) return;
+        if (!file.hasFileExtension("json"))
+          file = file.withFileExtension("json");
+        safeThis->mainLayout->getStatusBar().showMessage(
+            file.replaceWithText(json) ? "Theme exported to " + file.getFullPathName()
+                                       : "Could not write " + file.getFullPathName(), 4000);
+      });
+}
+
+static juce::File communityIndexCacheFile() {
+  return ThemeFile::userFolder().getParentDirectory().getChildFile("community-themes.json");
+}
+
+void MainComponent::loadCommunityIndexCache() {
+  std::vector<CommunityThemes::Entry> list;
+  juce::String error;
+  if (CommunityThemes::parseIndex(communityIndexCacheFile().loadFileAsString(), list, error))
+    communityThemes = std::move(list);
+}
+
+// What the user has of a community theme; official ones are compared with the built-in.
+static CommunityThemes::State communityStateOf(const CommunityThemes::Entry& e) {
+  juce::String builtinSha;
+  if (e.official)
+    if (const auto* b = ThemeRegistry::findBuiltin(e.name)) {
+      const auto text = ThemeFile::officialJson(*b);
+      builtinSha = CommunityThemes::sha256Of(juce::MemoryBlock(text.toRawUTF8(), text.getNumBytesAsUTF8()));
+    }
+  return CommunityThemes::stateOf(e, ThemeFile::userFolder(), builtinSha);
+}
+
+int MainComponent::communityNewCount() const {
+  const auto seen = juce::StringArray::fromLines(editorOptions.communityThemesSeen);
+  int n = 0;
+  for (const auto& e : communityThemes)
+    if (CommunityThemes::isNew(e, communityStateOf(e), seen))
+      ++n;
+  return n;
+}
+
+void MainComponent::checkCommunityThemes(bool userAsked) {
+  if (communityBusy)
+    return;
+  communityBusy = true;
+  communityStatus = "Looking at github.com/animatek/nme-themes...";
+  refreshCommunityThemesWindow();
+  juce::Component::SafePointer<MainComponent> safeThis(this);
+  juce::Thread::launch([safeThis, userAsked] {
+    const auto data = CommunityThemes::fetch(juce::String(CommunityThemes::kRawBase) + "index.json",
+                                             CommunityThemes::kMaxIndexBytes);
+    juce::MessageManager::callAsync([safeThis, userAsked, data] {
+      if (safeThis == nullptr)
+        return;
+      auto& self = *safeThis;
+      self.communityBusy = false;
+      std::vector<CommunityThemes::Entry> list;
+      juce::String error = "no answer (offline?)";
+      if (data && CommunityThemes::parseIndex(data->toString(), list, error)) {
+        communityIndexCacheFile().replaceWithData(data->getData(), data->getSize());
+        self.communityThemes = std::move(list);
+        self.editorOptions.communityThemesChecked = juce::Time::currentTimeMillis();
+        self.editorOptions.save(self.appProperties.getUserSettings());
+        self.communityStatus = juce::String(static_cast<int>(self.communityThemes.size()))
+                               + " theme(s) in the repository, checked "
+                               + juce::Time::getCurrentTime().toString(false, true, false) + ".";
+        // On its own it only speaks up when there is something new.
+        if (const int fresh = self.communityNewCount(); fresh > 0 && !userAsked && !self.communityThemesWindow)
+          self.mainLayout->getStatusBar().showMessage(
+              juce::String(fresh) + (fresh == 1 ? " new community theme" : " new community themes")
+                  + ": View > Theme > Community Themes", 8000);
+        self.menuItemsChanged();
+      } else {
+        self.communityStatus = "Could not read the list: " + error + ".";
+        if (!userAsked)
+          std::cout << "[THEMES] community check failed: " << error << std::endl;
+      }
+      self.refreshCommunityThemesWindow();
+    });
+  });
+}
+
+bool MainComponent::newVersionOut() const {
+  // Switched off in Editor Options, the last answer is not shown either.
+  return editorOptions.checkNewVersion
+      && VersionCheck::isNewer(editorOptions.latestVersion, JUCE_APPLICATION_VERSION_STRING);
+}
+
+bool MainComponent::newVersionUnseen() const {
+  return newVersionOut() && editorOptions.newVersionSeen != editorOptions.latestVersion;
+}
+
+void MainComponent::checkNewVersion() {
+  juce::Component::SafePointer<MainComponent> safeThis(this);
+  juce::Thread::launch([safeThis] {
+    const auto data = CommunityThemes::fetch(VersionCheck::kTagsUrl, VersionCheck::kMaxTagsBytes);
+    juce::MessageManager::callAsync([safeThis, data] {
+      if (safeThis == nullptr)
+        return;
+      auto& self = *safeThis;
+      // Offline, or GitHub said no (rate limit): quietly try again tomorrow's start.
+      const auto latest = data ? VersionCheck::latestRelease(data->toString()) : juce::String();
+      if (latest.isEmpty()) {
+        std::cout << "[VERSION] no answer from GitHub's tag list" << std::endl;
+        return;
+      }
+      const bool wasUnseen = self.newVersionUnseen();
+      self.editorOptions.latestVersion = latest;
+      self.editorOptions.newVersionChecked = juce::Time::currentTimeMillis();
+      self.editorOptions.save(self.appProperties.getUserSettings());
+      if (self.newVersionUnseen() && !wasUnseen && self.mainLayout != nullptr)
+        self.mainLayout->getStatusBar().showMessage(
+            "Animatek NME " + latest + " is out: About > Version " + latest + " to get it", 8000);
+      self.menuItemsChanged();
+    });
+  });
+}
+
+void MainComponent::showCommunityThemes() {
+  // The badges show what was new when the window opened; from then on it all counts as seen.
+  communitySeenWhenOpened = juce::StringArray::fromLines(editorOptions.communityThemesSeen);
+  if (!communityThemesWindow) {
+    communityThemesWindow = std::make_unique<CommunityThemesWindow>();
+    communityThemesWindow->onInstall = [this](const CommunityThemes::Entry& e) { installCommunityTheme(e); };
+    communityThemesWindow->onCheckNow = [this] { checkCommunityThemes(true); };
+    communityThemesWindow->onClosed = [this] {
+      juce::Component::SafePointer<MainComponent> safe(this);
+      juce::MessageManager::callAsync([safe] {
+        if (safe != nullptr) safe->communityThemesWindow.reset();
+      });
+    };
+  }
+  if (communityStatus.isEmpty())
+    communityStatus = communityThemes.empty() ? "No list yet."
+                                              : "The list from the last check. Check Now looks again.";
+  refreshCommunityThemesWindow();
+  communityThemesWindow->setVisible(true);
+  communityThemesWindow->toFront(true);
+  // Nothing in the repository yet, or the cached list is old: look now.
+  if (communityThemes.empty())
+    checkCommunityThemes(true);
+}
+
+void MainComponent::refreshCommunityThemesWindow() {
+  // Everything listed counts as seen once the window shows it.
+  if (communityThemesWindow) {
+    auto seen = juce::StringArray::fromLines(editorOptions.communityThemesSeen);
+    for (const auto& e : communityThemes)
+      seen.addIfNotAlreadyThere(CommunityThemes::seenKey(e));
+    seen.removeEmptyStrings();
+    if (seen.joinIntoString("\n") != editorOptions.communityThemesSeen) {
+      editorOptions.communityThemesSeen = seen.joinIntoString("\n");
+      editorOptions.save(appProperties.getUserSettings());
+      menuItemsChanged();
+    }
+  }
+  if (!communityThemesWindow)
+    return;
+  const auto current = ThemeRegistry::get(editorOptions.uiThemeIndex).name;
+  std::vector<CommunityThemesWindow::Row> rows;
+  for (const auto& e : communityThemes) {
+    CommunityThemesWindow::Row r;
+    r.entry = e;
+    r.state = communityStateOf(e);
+    r.isNew = CommunityThemes::isNew(e, r.state, communitySeenWhenOpened);
+    r.inUse = (r.state == CommunityThemes::State::Installed || r.state == CommunityThemes::State::BuiltIn)
+              && (current == e.name || current == e.name + " (user)");
+    rows.push_back(r);
+  }
+  communityThemesWindow->setRows(std::move(rows));
+  communityThemesWindow->setStatus(communityStatus);
+  communityThemesWindow->setBusy(communityBusy);
+}
+
+void MainComponent::installCommunityTheme(const CommunityThemes::Entry& entry) {
+  auto pick = [this](const juce::String& name) {
+    int idx = ThemeRegistry::indexOfName(name);
+    if (idx < 0)
+      idx = ThemeRegistry::indexOfName(name + " (user)");
+    if (idx >= 0)
+      chooseUiTheme(idx);
+    return idx >= 0;
+  };
+  // Already the repository's version, installed or built in: just use it.
+  if (const auto st = communityStateOf(entry);
+      st == CommunityThemes::State::Installed || st == CommunityThemes::State::BuiltIn) {
+    pick(entry.name);
+    refreshCommunityThemesWindow();
+    return;
+  }
+  if (communityBusy)
+    return;
+  communityBusy = true;
+  communityStatus = "Downloading " + entry.name + "...";
+  refreshCommunityThemesWindow();
+  juce::Component::SafePointer<MainComponent> safeThis(this);
+  juce::Thread::launch([safeThis, entry, pick] {
+    const auto data = CommunityThemes::fetch(juce::String(CommunityThemes::kRawBase) + "themes/" + entry.file,
+                                             ThemeFile::kMaxFileBytes);
+    juce::MessageManager::callAsync([safeThis, entry, data, pick] {
+      if (safeThis == nullptr)
+        return;
+      auto& self = *safeThis;
+      self.communityBusy = false;
+      EditorTheme theme;
+      juce::String error;
+      if (!data)
+        error = "the download failed (offline?)";
+      else if (CommunityThemes::sha256Of(*data) != entry.sha256)
+        error = "the file changed since the list was read; choose Check Now";
+      else if (!ThemeFile::fromJson(data->toString(), ThemeRegistry::get(1), theme, error))
+        error = "not a theme file: " + error;
+
+      if (error.isEmpty()) {
+        const auto themes = ThemeFile::userFolder();
+        themes.createDirectory();
+        if (!themes.getChildFile(entry.file).replaceWithData(data->getData(), data->getSize()))
+          error = "could not write it in " + themes.getFullPathName();
+      }
+      if (error.isEmpty()) {
+        ThemeRegistry::reloadUserThemes();
+        pick(theme.name);
+        self.communityStatus = entry.name + " installed and in use.";
+      } else {
+        self.communityStatus = "Could not install " + entry.name + ": " + error + ".";
+      }
+      self.refreshCommunityThemesWindow();
+    });
+  });
+}
+
 void MainComponent::showThemeEditor() {
   if (themeEditorWindow) {
     themeEditorWindow->toFront(true);
@@ -3137,11 +3554,12 @@ void MainComponent::showThemeEditor() {
   const bool builtin = ThemeRegistry::findBuiltin(cur.name) != nullptr;
   themeEditorWindow = std::make_unique<ThemeEditorWindow>(cur, builtin ? cur.name : "Dark");
   themeEditorWindow->onChange = [this](const EditorTheme& t) { applyThemeLive(t); };
+  themeEditorWindow->currentRender = [this] { return editorOptions.renderStyle(); };
   themeEditorWindow->onSaved = [this](const EditorTheme& t, const juce::File&) {
     ThemeRegistry::reloadUserThemes();
     const int idx = ThemeRegistry::indexOfName(t.name);
     if (idx >= 0)
-      applyUiTheme(idx, true);
+      chooseUiTheme(idx);
   };
   themeEditorWindow->onClosed = [this] {
     // Closing without saving puts the chosen theme back. The pointer is made out
@@ -3704,7 +4122,7 @@ bool MainComponent::handleFloaterShortcut(const juce::KeyPress& key) {
       // Ctrl+T cycles the theme from the main window (MainComponent::
       // keyPressed) — forward it here too so it also works while a floater
       // or slot window has keyboard focus instead of only the main one.
-      applyUiTheme(editorOptions.uiThemeIndex + 1, true);
+      chooseUiTheme(editorOptions.uiThemeIndex + 1);
       mainLayout->getStatusBar().showMessage(
           "Theme: " + ThemeRegistry::get(editorOptions.uiThemeIndex).name, 2500);
       return true;
@@ -4390,6 +4808,15 @@ bool MainComponent::isPortFreeForEmulator(int synth) const {
 }
 
 void MainComponent::connectFoundEmulators(const std::vector<DirectLink::Instance>& found) {
+  // An emulator still waiting for its name gets another try on every look: the name is given when
+  // the synth's settings and a patch have both arrived, and a moment missed (the patch first, a
+  // slow emulator) left it as "Modular" until it was clicked.
+  for (int synth = 0; synth < kMaxSynths; ++synth) {
+    const auto& st = synthState[static_cast<size_t>(synth)];
+    if (st.settingsKnown && !st.autoNameTried && synthHub.synth(synth).isConnected())
+      giveDuplicateEmulatorAName(synth);
+  }
+
   int waiting = 0;
   struct SetWaiting {
     MainComponent& mc; int& n;

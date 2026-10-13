@@ -46,6 +46,138 @@ int PchFileIO::splitAreaRows(const juce::StringArray& lines, juce::StringArray& 
     return area;
 }
 
+// What Clavia's editor 3.03 does to a 2.10 patch's parameters once it has read
+// them (NME303.exe at 0x4d3e88, G1-Emu issue #65; checked against 800 patches
+// the community archive holds in both formats). Every other parameter of every
+// other module is taken verbatim.
+//
+// 2.10 had no mute or bypass on these modules: 0 in the selector meant off.
+// 3.0 split it into the selector, one lower, and a mute (or bypass) that 2.10
+// files do not have, right after their last parameter.
+static const struct { int type; int selector; int mute; } kLegacySelectorWithOff[] = {
+    {   4, 1, 2 },   // 2Output destination
+    {   5, 1, 2 },   // 1Output destination
+    {   7, 4, 9 },   // OscA waveform
+    {   8, 3, 8 },   // OscB waveform
+    {  14, 2, 4 },   // OscSlvA waveform
+    {  24, 2, 7 },   // LFOA waveform
+    {  26, 2, 5 },   // LFOC waveform
+    {  51, 0, 9 },   // FilterE type (bypass)
+    {  79, 0, 5 },   // 4-1Switch input
+    {  80, 2, 4 },   // LFOSlvA waveform
+    {  88, 0, 2 },   // 1-4Switch output
+    {  92, 5, 6 },   // FilterF slope (bypass)
+    { 107, 3, 9 },   // SpectralOsc partials
+};
+
+// These had the switch already, but meaning "on": 3.0's mute is its inverse.
+// Left as it was, the oscillators arrived muted and most factory patches were
+// silent.
+static const struct { int type; int param; } kLegacyInvertedMute[] = {
+    {   9, 5 },   // OscC
+    {  10, 4 },   // OscSlvB
+    {  11, 3 },   // OscSlvC
+    {  12, 3 },   // OscSlvD
+    {  13, 3 },   // OscSlvE
+    {  58, 15 },  // DrumSynth
+    {  85, 4 },   // OscSlvFM
+    {  95, 6 },   // PercOsc
+    {  96, 3 },   // FormantOsc
+    { 106, 18 }, { 106, 19 }, { 106, 20 },   // OscSineBank, its six oscillators
+    { 106, 21 }, { 106, 22 }, { 106, 23 },
+};
+
+// 2.10's morph knobs were a module of their own, type 6, gone in 3.0.
+static constexpr int kLegacyMorphModuleType = 6;
+
+void PchFileIO::convertLegacyParams(Module& module, int type)
+{
+    for (const auto& f : kLegacySelectorWithOff)
+    {
+        if (f.type != type)
+            continue;
+        auto* selector = module.getParameter(f.selector);
+        auto* mute = module.getParameter(f.mute);
+        if (selector == nullptr || mute == nullptr)
+            continue;
+        const int value = selector->getValue();
+        mute->setValue(value == 0 ? 1 : 0);
+        selector->setValue(juce::jmax(0, value - 1));
+    }
+    for (const auto& f : kLegacyInvertedMute)
+        if (f.type == type)
+            if (auto* mute = module.getParameter(f.param))
+                mute->setValue(mute->getValue() == 0 ? 1 : 0);
+}
+
+// [Knobs] (Mn/Pn: knob n), [Controllers] (Mn/Pn: MIDI CC n) and [Morphs]
+// (Mn/Pn/Gn/Dn: module, parameter, group, range), all in the poly area, which
+// was the only one. A knob or controller on the morph module moves that morph
+// group (section 2, module 1 in 3.0), and its two pseudo-controllers, 127 and
+// 126, are 3.0's keyboard assignment of the group: velocity (1) and note (2).
+void PchFileIO::convertLegacyAssignments(Patch& patch, int morphModule, const juce::StringArray& knobLines,
+                                         const juce::StringArray& controllerLines, const juce::StringArray& morphLines)
+{
+    auto entries = [](const juce::StringArray& lines)
+    {
+        std::vector<int> numbers;
+        for (const auto& raw : lines)
+        {
+            const auto line = raw.trim();
+            if (line.startsWithChar('M') && line.containsChar('='))
+                numbers.push_back(line.substring(1, line.indexOfChar('=')).getIntValue());
+        }
+        return numbers;
+    };
+    auto value = [](const juce::StringArray& lines, const char* key, int n)
+    {
+        return getLegacyValue(lines, key + juce::String(n));
+    };
+
+    for (const int n : entries(knobLines))
+    {
+        if (n < 0 || n >= (int) patch.knobAssignments.size())
+            continue;
+        const int module = value(knobLines, "M", n).getIntValue();
+        auto& knob = patch.knobAssignments[(size_t) n];
+        knob.assigned = true;
+        knob.section = module == morphModule ? 2 : 1;
+        knob.module = module == morphModule ? 1 : module;
+        knob.param = value(knobLines, "P", n).getIntValue();
+    }
+
+    for (const int n : entries(controllerLines))
+    {
+        const int module = value(controllerLines, "M", n).getIntValue();
+        const int param = value(controllerLines, "P", n).getIntValue();
+        if (module == morphModule && (n == 126 || n == 127))
+        {
+            if (param >= 0 && param < 4)
+                patch.morphKeyboard[(size_t) param] = n == 127 ? 1 : 2;
+            continue;
+        }
+        if (n > 125)
+            continue;
+        CtrlAssignment ctrl;
+        ctrl.control = n;
+        ctrl.section = module == morphModule ? 2 : 1;
+        ctrl.module = module == morphModule ? 1 : module;
+        ctrl.param = param;
+        patch.ctrlAssignments.push_back(ctrl);
+    }
+
+    for (const int n : entries(morphLines))
+    {
+        MorphAssignment morph;
+        morph.section = 1;
+        morph.module = value(morphLines, "M", n).getIntValue();
+        morph.param = value(morphLines, "P", n).getIntValue();
+        morph.morph = value(morphLines, "G", n).getIntValue();
+        morph.range = value(morphLines, "D", n).getIntValue();
+        patch.morphAssignments.push_back(morph);
+    }
+}
+
 struct LegacyCableEntry
 {
     int sourceModule = 0;
@@ -319,6 +451,8 @@ std::unique_ptr<Patch> PchFileIO::readLegacyFile(const juce::StringArray& allLin
     auto patch = std::make_unique<Patch>();
     auto& header = patch->getHeader();
     std::vector<LegacyCableEntry> pendingCables;
+    int morphModule = -1;
+    juce::StringArray knobLines, controllerLines, morphLines;
 
     int i = 0;
     while (i < allLines.size())
@@ -372,7 +506,13 @@ std::unique_ptr<Patch> PchFileIO::readLegacyFile(const juce::StringArray& allLin
             const int moduleIndex = sectionName.fromFirstOccurrenceOf(" ", false, false).getIntValue();
             const int type = getLegacyValue(sectionLines, "Type").getIntValue();
 
-            if (auto* desc = descs.getModuleByIndex(type))
+            if (type == kLegacyMorphModuleType)
+            {
+                morphModule = moduleIndex;
+                for (int g = 0; g < 4; ++g)
+                    patch->morphValues[(size_t) g] = getLegacyValue(sectionLines, "P" + juce::String(g)).getIntValue();
+            }
+            else if (auto* desc = descs.getModuleByIndex(type))
             {
                 auto module = Module::createFromDescriptor(*desc);
                 module->setContainerIndex(moduleIndex);
@@ -382,29 +522,33 @@ std::unique_ptr<Patch> PchFileIO::readLegacyFile(const juce::StringArray& allLin
                 const auto name = getLegacyValue(sectionLines, "Name");
                 if (name.isNotEmpty()) module->setTitle(name);
 
+                // The on/off switches after the last P (a sequencer's steps,
+                // its loop, the sine bank's mutes) come packed in BP0, the
+                // first in its lowest bit; reading only the P keys left every
+                // 2.10 sequence empty.
+                int lastP = -1;
+                for (const auto& param : module->getParameters())
+                    if (param.getDescriptor()->paramClass == "parameter"
+                        && getLegacyValue(sectionLines, "P" + juce::String(param.getDescriptor()->index)).isNotEmpty())
+                        lastP = juce::jmax(lastP, param.getDescriptor()->index);
+                const auto packed = getLegacyValue(sectionLines, "BP0");
+                const auto packedBits = (juce::uint32) packed.getLargeIntValue();
+
                 for (const auto& param : module->getParameters())
                 {
                     if (param.getDescriptor()->paramClass != "parameter")
                         continue;
 
-                    const auto value = getLegacyValue(sectionLines, "P" + juce::String(param.getDescriptor()->index));
+                    const int index = param.getDescriptor()->index;
+                    auto value = getLegacyValue(sectionLines, "P" + juce::String(index));
+                    const int bit = index - lastP - 1;
+                    if (value.isEmpty() && packed.isNotEmpty() && bit >= 0 && bit < 32)
+                        value = juce::String((int) ((packedBits >> bit) & 1));
                     if (value.isNotEmpty())
-                        if (auto* mutableParam = module->getParameter(param.getDescriptor()->index))
-                        {
-                            int paramValue = value.getIntValue();
-                            // 2.10 stores output destinations 1-based (1 = "1/2");
-                            // 3.0 is 0-based, so a verbatim copy lands every
-                            // factory patch on outputs 3/4 (issue #14 follow-up).
-                            // Only the "audio,out,assign" role means an output
-                            // destination — "morph,assign" (morph keyboard
-                            // assignment) also contains "assign" and must NOT
-                            // be remapped, or legacy patches using it get
-                            // silently decremented (found in code review).
-                            if (param.getDescriptor()->role.contains("out,assign"))
-                                paramValue = juce::jmax(0, paramValue - 1);
-                            mutableParam->setValue(paramValue);
-                        }
+                        if (auto* mutableParam = module->getParameter(index))
+                            mutableParam->setValue(value.getIntValue());
                 }
+                convertLegacyParams(*module, type);
 
                 for (const auto& cableLine : sectionLines)
                 {
@@ -438,8 +582,20 @@ std::unique_ptr<Patch> PchFileIO::readLegacyFile(const juce::StringArray& allLin
                 patch->getPolyVoiceArea().addModule(std::move(module));
             }
         }
+        else if (sectionName.equalsIgnoreCase("Knobs"))       knobLines = sectionLines;
+        else if (sectionName.equalsIgnoreCase("Controllers")) controllerLines = sectionLines;
+        else if (sectionName.equalsIgnoreCase("Morphs"))      morphLines = sectionLines;
+        else if (sectionName.equalsIgnoreCase("Notes"))
+        {
+            const int count = getLegacyValue(sectionLines, "Count").getIntValue();
+            juce::StringArray text;
+            for (int n = 0; n < count; ++n)
+                text.add(getLegacyValue(sectionLines, "L" + juce::String(n)));
+            patch->patchNotes = text.joinIntoString("\n").trimEnd();
+        }
     }
 
+    convertLegacyAssignments(*patch, morphModule, knobLines, controllerLines, morphLines);
     normalizeLegacyModulePositions(patch->getPolyVoiceArea());
 
     for (const auto& cable : pendingCables)

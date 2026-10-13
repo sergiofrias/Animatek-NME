@@ -2,6 +2,120 @@
 
 ## Unreleased
 
+## 0.22.0 — 2026-10-13
+
+### Added
+
+- **NME says when a new version is out** (2026-10-13, #97). On startup, at most once a day,
+  it reads the release tags of this repository from GitHub's tag list (`vX.Y.Z` only: a tag is a
+  release, a push is not). When one is newer than the running build, **About** gets a red dot and
+  a first item "Version X.Y.Z is out: get it on Patreon" that opens the Patreon collection; the
+  status bar says so once. Choosing the item clears the dot; the item stays until that version is
+  installed. Not an updater: the builds are behind Patreon, so NME never downloads anything.
+  Silent when offline or rate-limited. Editor Options: "Tell me when a new version of NME is
+  out", on by default; off also hides the last answer. New `VersionCheck` (`source/ui/`), tested
+  in `test_version_check.cpp` (plain tags only, numeric compare so 0.10 is after 0.9, the highest
+  tag whatever GitHub's order, error answers ignored); tried by Javier with a fake 0.99.0 in the settings. Also fixed on the way: OK in Editor Options
+  no longer puts back what the background checks wrote while the dialog was open (the themes
+  check's date and seen list included).
+- **Community themes from animatek/nme-themes** (2026-10-13, #91). View > Theme > **Community
+  Themes...** opens a window listing the repository's themes (name, author, description), with a
+  New badge on the ones not seen before and Update on the ones whose file changed, and an
+  Install / Update / Use button that downloads the file, checks its SHA-256 against the list,
+  reads it as a theme, writes it as it is into the user themes folder and switches to it. The
+  list is the repository's `index.json`, rebuilt there by CI on every merge
+  (`tools/build_index.py`, which also checks each theme on pull requests). NME reads it on
+  startup at most once a day (Editor Options: "Look for new community themes once a day", on by
+  default), caches it in `community-themes.json` next to the settings, shows "(N new)" in the menu,
+  a red dot on **View** and on **Theme** (as VCV Rack does for its library) until the window is
+  opened (drawn by `AppLookAndFeel`, the app's default LookAndFeel from now on; macOS's native menu
+  bar shows a text bullet instead), and says so in the status bar; Check Now reads it at once. Downloads run off the message thread;
+  on Linux through `curl`, since the app is built without libcurl. New `juce_cryptography` link
+  for the SHA-256. Manual (en/es). Checked: `nme_tests` passes with `test_community_themes.cpp`
+  (index parsing drops file names that could leave the folder; new/seen/changed), the Release
+  build compiles clean, and the live index and theme file from raw.githubusercontent.com match by
+  hash. Tried on the window: installing Tokyo Super Dark from the list works.
+- **NME's own themes are kept in animatek/nme-themes too, and update from there** (2026-10-13, #91).
+  The 14 built-in themes are in the repository as official files (`"official": true`), written by
+  the new `nme_theme_export` tool (`tests/theme_export.cpp`, `ThemeFile::officialJson`: every colour,
+  LF line ends, so the hash is the same on every OS). Community Themes lists them as **Built in**
+  while the repository's copy hashes the same as what NME ships; when one is touched there it
+  offers an **Update**, and the installed official file replaces the built-in in place
+  (`ThemeRegistry::mergeUserThemes`: same index, same saved choice) instead of appearing beside it
+  as "(user)". Checked: `nme_tests` passes with two new cases (official file round trip and state,
+  replacement in place).
+- **A theme can set the render style, and themes import and export as single files** (2026-10-13,
+  #90). A theme file may carry `"render"` (`wireframe`, `hardwareLook`, `knobStyle`, `flatKnobs`,
+  each optional) and, when the theme is chosen (View menu, `Ctrl+T`, Editor Options, the theme
+  editor's Save, an import), those keys are applied over the user's own style. The user's style is
+  kept (`renderBeforeTheme` in the settings) and given back when a theme that sets none is chosen,
+  so a theme's flat knobs do not follow the user into every theme after it. **Animatek Rack** now
+  turns Flat knobs on. The theme editor has a "Save the render style with the theme" box. View >
+  Theme has **Import Theme File...** (checked with the same reader, files over 256 KB refused, a
+  built-in's name gets " (imported)", a user theme of the same name replaced only on confirmation)
+  and **Export Current Theme...**. Manual (en/es) gets a "Your own themes" section, which 0.20 did
+  not have. Checked: `nme_tests` passes with two new cases in `test_theme_file.cpp`; the Release
+  build compiles clean. The theme editor and Community Themes tried by Javier on the window
+  (2026-10-13); import and export not tried there.
+- **A Windows installer for the Patreon builds** (2026-10-13, asked by Javier). `build-binaries.yml`
+  now also makes `AnimatekNME-x.y.z-windows-setup.exe` (Inno Setup 6, `packaging/windows/AnimatekNME.iss`)
+  from the same files as the ZIP, with its SHA-256 and in the same Sigstore attestation, and puts
+  it in the private draft. It installs for the current user, in `%LOCALAPPDATA%\Programs`, so no
+  administrator and no UAC prompt; adds a Start menu entry (a desktop one is optional); replaces
+  an earlier version in place, offering to close a running NME; and uninstalls from Settings →
+  Apps. Settings and patches are never touched. The ZIP stays. Manual (en/es), the README in the
+  package, `PATREON_BUILDS.md` and the release checklist say so. Checked here with 0.21.0's files:
+  it compiles, installs silently with no prompt, shows in the Start menu and in Windows' installed
+  apps, and uninstalls leaving nothing behind. The workflow's new step runs on the next build.
+
+### Fixed
+
+- **The theme editor had no swatch for the module panel colour** (2026-10-13, asked by Javier).
+  `moduleBg` was in theme files but not in the editor: it is now under "Modules and canvas" as
+  "Module panel (empty = each module's own colour)", since transparent means each module keeps its
+  type colour (Nomad, Nord Classic). Rows that can be automatic (this one and the sequencer
+  colours) have an **Auto** button that sets them back, instead of dragging alpha down to 0.
+- **The theme editor's colour picker showed its values black on black** (2026-10-13, reported by
+  Javier). The red/green/blue/alpha boxes took the theme's text colour on the picker's fixed dark
+  background; they now have the editor window's own light-on-dark colours.
+- **Old 2.10 patches are converted as Clavia's editor converts them; most factory patches loaded
+  silent** (2026-10-13, G1-Emu issue #65). A 2.10 file was read with its values copied verbatim
+  and its morph and assignment sections left out. The rules now come from Clavia's editor 3.03
+  itself (`NME303.exe`, read for its behaviour in `G1originaleditor/notes/14-conversion-pch-2.10.md`):
+  - in 13 modules (outputs, OscA/OscB/OscSlvA, LFOs, FilterE/FilterF, the 1-4 and 4-1 switches,
+    SpectralOsc) a selector's 0 meant "off": 3.0 takes it one lower and adds the mute or bypass
+    2.10 did not have. Outputs, waveforms and filter types were one step off, and an "off" one
+    played;
+  - in 10 modules (the slave oscillators, OscC, PercOsc, FormantOsc, DrumSynth, the sine bank's
+    six) the switch meant "on", the inverse of 3.0's mute: they arrived muted (FM Dream 2, Poing,
+    Big Syn...);
+  - the switches after the last `P` come packed in `BP0`, which was ignored: every sequencer's
+    steps came out empty (In The Air);
+  - the morph knobs were a module (type 6), which was dropped: its four values are now the morph
+    groups', and `[Morphs]`, `[Knobs]` and `[Controllers]` (with velocity and note on a morph as
+    controllers 127 and 126) become the morph, knob and MIDI CC maps; `[Notes]` the patch notes.
+
+  Checked: `nme_tests` passes, with `test_pch_legacy210.cpp`, which fails without it. Over 800
+  patches the community archive holds in both formats, the parameter values that differ from the
+  3.0 copy drop from 3,486 to 1,305 of 75,772, and what is left is the copies' authors' own edits
+  (both formats show a waveform's full range, 0 to 4, so the conversion is not what differs). In the
+  emulated G1, of 40 2.10 factory patches 16 were silent; now all sound but five that are silent by
+  design: two need the MIDI clock running, one starts when knob 4 is turned (its notes say so), and
+  two process the audio inputs.
+
+- **Every port looked taken after a few emulators came and went** (2026-10-08). A port whose
+  emulator had gone keeps that emulator's direct link as its device; MIDI Setup could not show it,
+  left the port's lists empty, and took that as a change: OK or Apply saved the port as switched
+  off by hand, and the editor never gave it to an emulator again. One by one the ports went, until
+  new emulators found none free while most were empty. MIDI Setup now keeps a device it cannot
+  show, a port is only made the user's when the user changes it (Apply retrying an enabled port is
+  not a change), and on the first start the ports saved that way are handed back to the emulators
+  (`emulatorPortsRepaired`). Seen in Javier's settings: Ports 3 to 8 switched off, none by him.
+- **A new emulator kept "Modular" until it was clicked** (2026-10-08). The name is given once the
+  synth's settings and a patch have both arrived; when that moment was missed the editor did not
+  try again until something else brought a patch. It now tries again on every look for emulators
+  (every 3 s) while one is still waiting for its name. Not tried on the window yet.
+
 ## 0.21.0 — 2026-10-08
 
 ### Added
