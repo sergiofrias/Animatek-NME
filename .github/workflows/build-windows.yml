@@ -32,8 +32,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.21.0-windows # You can update this tag name whenever a new version drops
-          name: "Animatek NME v0.21.0 (Windows Build)"
+          tag_name: v0.22.0-windows # You can update this tag name whenever a new version drops
+          name: "Animatek NME v0.22.0 (Windows Build)"
           generate_release_notes: true # Automatically generates release notes from commits!
           files: AnimatekNME-Windows.zip
         env:
